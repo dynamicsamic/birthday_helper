@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Literal
 
 import pandas as pd
+from openpyxl import load_workbook
 
 from src.data_processing.atomic_operation import (
     AtomicOperation,
@@ -20,7 +21,7 @@ from src.exceptions import (
 from src.logging import get_logger
 
 SupportedExcelEngines = Literal["openpyxl", "calamine", "odf", "pyxlsb", "xlrd"]
-QueryFunction = Callable[[pd.Series], pd.Series]
+QueryFunction = Callable[[pd.Series], bool]
 
 logger = get_logger(__name__)
 
@@ -28,16 +29,21 @@ logger = get_logger(__name__)
 class FileHandlerProtocol(WriteSafeFileHandlerProtocol):
     atomic_write: AtomicOperation
 
-    async def read_file(self) -> Iterable: ...
+    async def read_file(self) -> Iterable:
+        ...
 
-    async def append_row(self, row: dict): ...
+    async def append_row(self, row: dict):
+        ...
 
-    async def update_rows(self, query: Callable, rows: dict) -> int: ...
+    async def update_rows(self, query: Callable, rows: dict) -> int:
+        ...
 
-    async def delete_rows(self, query: Callable) -> int: ...
+    async def delete_rows(self, query: Callable) -> int:
+        ...
 
     @property
-    def last_modified(self) -> float: ...
+    def last_modified(self) -> float:
+        ...
 
 
 class ExcelFileHandler:
@@ -45,8 +51,8 @@ class ExcelFileHandler:
 
     def __init__(
         self,
-        file_path: str,
-        backup_dir: str,
+        file_path: str | Path,
+        backup_dir: str | Path,
         thread_pool_executor: ThreadPoolExecutor,
         excel_engine: SupportedExcelEngines = "openpyxl",
     ):
@@ -80,24 +86,16 @@ class ExcelFileHandler:
                 logger.error(f"Error writing Excel file: {e}")
                 raise FileHandlerWriteFileError from e
 
-    async def append_row(self, data: dict[str, Any]):
-        # async with self.atomic_write:
-        try:
-            df = await self.read_file()
-            updated_df = await self._run_in_thread(
-                partial(self._in_memory_append_row, df, data)
-            )
-            await self.write_file(updated_df)
-            logger.info(f"Row appended to Excel file: {self.file_path}")
-        except FileHandlerReadFileError as e:
-            logger.error(f"Error reading Excel file: {e}")
-            raise
-        except FileHandlerWriteFileError as e:
-            logger.error(f"Error writing updated Excel file: {e}")
-            raise
-        except Exception as e:
-            logger.error(f"Error appending row to Excel file: {e}")
-            raise FileHandlerOperationError from e
+    async def append_row(self, row: list[str | int]) -> bool:
+        result = False
+        async with self.atomic_write:
+            try:
+                result = await self._run_in_thread(partial(self._sync_append_row, row))
+            except Exception as e:
+                logger.error(f"Error appending row to Excel file: {e}")
+                raise FileHandlerOperationError from e
+
+        return result
 
     async def update_rows(self, query: QueryFunction, update: dict):
         # async with self.atomic_write:
@@ -142,7 +140,7 @@ class ExcelFileHandler:
     def get_lock(self) -> asyncio.Lock:
         return self.write_lock
 
-    async def create_backup(self) -> str:
+    async def create_backup(self) -> Path:
         backup_path = self._create_backup_path()
         logger.info(f"Creating backup of {self.file_path} at {backup_path}")
         await self._run_in_thread(partial(shutil.copy2, self.file_path, backup_path))
@@ -162,6 +160,48 @@ class ExcelFileHandler:
             df.to_excel(tmp.name, index=False, engine=self.engine, **kwargs)
             shutil.move(tmp.name, self.file_path)
         logger.info(f"Excel file written successfully: {self.file_path}")
+
+    def _sync_append_row(self, row: list[str | int]) -> bool:
+        try:
+            wb = load_workbook(self.file_path)
+        except Exception as e:
+            logger.error(f"Error loading the Excel workdbook: {e}")
+            return False
+
+        ws = wb.active
+        if ws:
+            try:
+                ws.append(row)
+            except Exception as e:
+                logger.error(f"Error appending row to Excel file: {e}")
+                return False
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            wb.save(tmp.name)
+            shutil.move(tmp.name, self.file_path)
+        wb.close()
+        return True
+
+        return False
+
+    async def _append_row(self, data: dict[str, Any]):
+        """A less efficient version for row appending."""
+        # async with self.atomic_write:
+        try:
+            df = await self.read_file()
+            updated_df = await self._run_in_thread(
+                partial(self._in_memory_append_row, df, data)
+            )
+            await self.write_file(updated_df)
+            logger.info(f"Row appended to Excel file: {self.file_path}")
+        except FileHandlerReadFileError as e:
+            logger.error(f"Error reading Excel file: {e}")
+            raise
+        except FileHandlerWriteFileError as e:
+            logger.error(f"Error writing updated Excel file: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Error appending row to Excel file: {e}")
+            raise FileHandlerOperationError from e
 
     def _in_memory_append_row(
         self, df: pd.DataFrame, data: dict[str, Any]
