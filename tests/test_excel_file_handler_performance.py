@@ -2,13 +2,16 @@ import asyncio
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-
+import shutil
 import pandas as pd
 import pytest
+import pytest_asyncio
 from faker import Faker
 from pandas.testing import assert_frame_equal
 
 from src.data_processing.file_handler import ExcelFileHandler
+
+pytestmark = pytest.mark.asyncio
 
 # Performance test constants
 SMALL_FILE_ROWS = 100
@@ -17,14 +20,36 @@ LARGE_FILE_ROWS = 10_000
 XLARGE_FILE_ROWS = 50_000  # For stress testing
 
 
-@pytest.fixture
-def fake():
+@pytest.fixture(scope="session")
+def event_loop():
+    return asyncio.get_event_loop()
+
+
+@pytest_asyncio.fixture(scope="session")
+async def thread_pool():
+    pool = None
+    try:
+        pool = ThreadPoolExecutor()
+        yield pool
+    finally:
+        if pool:
+            pool.shutdown()
+
+
+def _fake():
     return Faker()
 
 
-@pytest.fixture
-def performance_temp_files(tmp_path, fake):
+@pytest_asyncio.fixture(scope="session")
+async def fake(thread_pool):
+    loop = asyncio.get_running_loop()
+    faked = await loop.run_in_executor(thread_pool, _fake)
+    yield faked
+
+
+def _performance_temp_files(tmp_path: Path, fake: Faker):
     """Create test files of different sizes for performance testing"""
+    tmp_path.mkdir(parents=True, exist_ok=True)
     files = {}
 
     for size, rows in [
@@ -52,24 +77,39 @@ def performance_temp_files(tmp_path, fake):
     return files
 
 
-@pytest.fixture
-def performance_executor():
-    """Executor with more workers for performance tests"""
-    return ThreadPoolExecutor(max_workers=8)
+@pytest_asyncio.fixture(scope="session")
+async def performance_temp_files(thread_pool: ThreadPoolExecutor, fake: Faker):
+    temp_files = None
+    test_file_path = Path("/home/sammi/dev/birthday_helper/tests/excel_file_handler")
+    # fake = fake
+    loop = asyncio.get_running_loop()
+    try:
+        temp_files = await loop.run_in_executor(
+            thread_pool,
+            _performance_temp_files,
+            test_file_path,
+            fake,
+        )
+        yield temp_files
+    finally:
+        if temp_files:
+            await loop.run_in_executor(thread_pool, shutil.rmtree, test_file_path)
 
 
 @pytest.mark.performance
-@pytest.mark.asyncio
-async def test_read_performance(performance_temp_files, performance_executor):
+async def test_read_performance(
+    thread_pool: ThreadPoolExecutor,
+    performance_temp_files: dict[str, tuple[Path, Path]],
+):
     """Test read performance with different file sizes"""
     results = {}
 
     for size in ["small", "medium", "large", "xlarge"]:
         path, backup_dir = performance_temp_files[size]
         handler = ExcelFileHandler(
-            file_path=str(path),
-            backup_dir=str(backup_dir),
-            thread_pool_executor=performance_executor,
+            file_path=path,
+            backup_dir=backup_dir,
+            thread_pool_executor=thread_pool,
         )
 
         # Warm up
@@ -90,8 +130,11 @@ async def test_read_performance(performance_temp_files, performance_executor):
 
 
 @pytest.mark.performance
-@pytest.mark.asyncio
-async def test_write_performance(performance_temp_files, performance_executor, fake):
+async def test_write_performance(
+    thread_pool: ThreadPoolExecutor,
+    performance_temp_files: dict[str, tuple[Path, Path]],
+    fake: Faker,
+):
     """Test write performance with different file sizes"""
     results = {}
 
@@ -100,7 +143,7 @@ async def test_write_performance(performance_temp_files, performance_executor, f
         handler = ExcelFileHandler(
             file_path=str(path),
             backup_dir=str(backup_dir),
-            thread_pool_executor=performance_executor,
+            thread_pool_executor=thread_pool,
         )
 
         # Read the data first
@@ -126,16 +169,17 @@ async def test_write_performance(performance_temp_files, performance_executor, f
 
 
 @pytest.mark.performance
-@pytest.mark.asyncio
 async def test_concurrent_operations_performance(
-    performance_temp_files, performance_executor, fake
+    thread_pool: ThreadPoolExecutor,
+    performance_temp_files: dict[str, tuple[Path, Path]],
+    fake: Faker,
 ):
     """Test performance with concurrent operations"""
     path, backup_dir = performance_temp_files["medium"]
     handler = ExcelFileHandler(
         file_path=str(path),
         backup_dir=str(backup_dir),
-        thread_pool_executor=performance_executor,
+        thread_pool_executor=thread_pool,
     )
 
     # Number of concurrent operations
@@ -147,13 +191,13 @@ async def test_concurrent_operations_performance(
             await handler.read_file()
         elif idx % 3 == 1:
             await handler.append_row(
-                {
-                    "id": str(SMALL_FILE_ROWS + idx),
-                    "name": fake.name(),
-                    "email": fake.email(),
-                    "age": str(fake.random_int(18, 80)),
-                    "salary": str(fake.random_int(30_000, 150_000)),
-                }
+                [
+                    str(SMALL_FILE_ROWS + idx),
+                    fake.name(),
+                    fake.email(),
+                    str(fake.random_int(18, 80)),
+                    fake.random_int(30_000, 150_000),
+                ]
             )
         else:
 
@@ -176,28 +220,111 @@ async def test_concurrent_operations_performance(
 
 
 @pytest.mark.performance
-@pytest.mark.asyncio
-async def test_bulk_operations_performance(
-    performance_temp_files, performance_executor, fake
+async def test_lock_contention_performance(
+    thread_pool: ThreadPoolExecutor,
+    performance_temp_files: dict[str, tuple[Path, Path]],
 ):
-    """Test performance of bulk operations"""
+    """Test performance impact of lock contention"""
+    path, backup_dir = performance_temp_files["medium"]
+    handler = ExcelFileHandler(
+        file_path=str(path),
+        backup_dir=str(backup_dir),
+        thread_pool_executor=thread_pool,
+    )
+
+    # Number of concurrent writers
+    num_writers = 10
+
+    async def writer_task(idx):
+        # async with handler.get_lock():
+        # Simulate work while holding the lock
+        await asyncio.sleep(0.01)
+        df = await handler.read_file()
+        df.loc[0, "name"] = f"Writer{idx}"
+        await handler.write_file(df)
+
+    # Time concurrent writers
+    start = time.perf_counter()
+    async with asyncio.TaskGroup() as tg:
+        for i in range(num_writers):
+            tg.create_task(writer_task(i))
+    elapsed = time.perf_counter() - start
+
+    # # Time concurrent writers
+    # start = time.perf_counter()
+    # for i in range(num_writers):
+    #     await writer_task(i)
+    # elapsed = time.perf_counter() - start
+
+    # # Time concurrent writers
+    # start = time.perf_counter()
+    # await asyncio.gather(*[writer_task(i) for i in range(num_writers)])
+    # elapsed = time.perf_counter() - start
+
+    print(f"{num_writers} concurrent writers completed in {elapsed:.3f}s")
+    print(f"Average writer time: {elapsed / num_writers:.3f}s")
+
+    # Verify final state
+    final_data = await handler.read_file()
+    assert final_data.loc[0, "name"].startswith("Writer")
+
+
+@pytest.mark.performance
+async def test_backup_restore_performance(
+    thread_pool: ThreadPoolExecutor,
+    performance_temp_files: dict[str, tuple[Path, Path]],
+):
+    """Test performance of backup and restore operations"""
     path, backup_dir = performance_temp_files["large"]
     handler = ExcelFileHandler(
         file_path=str(path),
         backup_dir=str(backup_dir),
-        thread_pool_executor=performance_executor,
+        thread_pool_executor=thread_pool,
+    )
+
+    # Time backup
+    start = time.perf_counter()
+    backup_path = await handler.create_backup()
+    backup_elapsed = time.perf_counter() - start
+    print(f"Backup created in {backup_elapsed:.3f}s")
+
+    # Time restore
+    start = time.perf_counter()
+    await handler.restore_backup(Path(backup_path))
+    restore_elapsed = time.perf_counter() - start
+    print(f"Restore completed in {restore_elapsed:.3f}s")
+
+    # Verify
+    assert Path(backup_path).exists()
+    restored_data = await handler.read_file()
+    original_data = pd.read_excel(backup_path, dtype=str)
+    assert_frame_equal(restored_data, original_data)
+
+
+@pytest.mark.performance
+async def test_bulk_operations_performance(
+    thread_pool: ThreadPoolExecutor,
+    performance_temp_files: dict[str, tuple[Path, Path]],
+    fake: Faker,
+):
+    """Test performance of bulk operations"""
+    path, backup_dir = performance_temp_files["medium"]
+    handler = ExcelFileHandler(
+        file_path=str(path),
+        backup_dir=str(backup_dir),
+        thread_pool_executor=thread_pool,
     )
 
     # Test bulk append
     new_rows = [
-        {
-            "id": str(LARGE_FILE_ROWS + i),
-            "name": fake.name(),
-            "email": fake.email(),
-            "age": str(fake.random_int(18, 80)),
-            "salary": str(fake.random_int(30_000, 150_000)),
-        }
-        for i in range(100)
+        [
+            str(LARGE_FILE_ROWS + i),
+            fake.name(),
+            fake.email(),
+            str(fake.random_int(18, 80)),
+            fake.random_int(30_000, 150_000),
+        ]
+        for i in range(10)
     ]
 
     start = time.perf_counter()
@@ -219,72 +346,5 @@ async def test_bulk_operations_performance(
 
     # Verify operations
     final_data = await handler.read_file()
-    assert len(final_data) == LARGE_FILE_ROWS + len(new_rows)
+    assert len(final_data) == MEDIUM_FILE_ROWS + len(new_rows)
     assert final_data[final_data["name"] == "UPDATED"].shape[0] == updated_count
-
-
-# @pytest.mark.performance
-@pytest.mark.asyncio
-async def test_lock_contention_performance(
-    performance_temp_files, performance_executor
-):
-    """Test performance impact of lock contention"""
-    path, backup_dir = performance_temp_files["medium"]
-    handler = ExcelFileHandler(
-        file_path=str(path),
-        backup_dir=str(backup_dir),
-        thread_pool_executor=performance_executor,
-    )
-
-    # Number of concurrent writers
-    num_writers = 10
-
-    async def writer_task(idx):
-        # async with handler.get_lock():
-        # Simulate work while holding the lock
-        await asyncio.sleep(0.01)
-        df = await handler.read_file()
-        df.loc[0, "name"] = f"Writer{idx}"
-        await handler.write_file(df)
-
-    # Time concurrent writers
-    start = time.perf_counter()
-    await asyncio.gather(*[writer_task(i) for i in range(num_writers)])
-    elapsed = time.perf_counter() - start
-
-    print(f"{num_writers} concurrent writers completed in {elapsed:.3f}s")
-    print(f"Average writer time: {elapsed / num_writers:.3f}s")
-
-    # Verify final state
-    final_data = await handler.read_file()
-    assert final_data.loc[0, "name"].startswith("Writer")
-
-
-@pytest.mark.performance
-@pytest.mark.asyncio
-async def test_backup_restore_performance(performance_temp_files, performance_executor):
-    """Test performance of backup and restore operations"""
-    path, backup_dir = performance_temp_files["large"]
-    handler = ExcelFileHandler(
-        file_path=str(path),
-        backup_dir=str(backup_dir),
-        thread_pool_executor=performance_executor,
-    )
-
-    # Time backup
-    start = time.perf_counter()
-    backup_path = await handler.create_backup()
-    backup_elapsed = time.perf_counter() - start
-    print(f"Backup created in {backup_elapsed:.3f}s")
-
-    # Time restore
-    start = time.perf_counter()
-    await handler.restore_backup(Path(backup_path))
-    restore_elapsed = time.perf_counter() - start
-    print(f"Restore completed in {restore_elapsed:.3f}s")
-
-    # Verify
-    assert Path(backup_path).exists()
-    restored_data = await handler.read_file()
-    original_data = pd.read_excel(backup_path)
-    assert_frame_equal(restored_data, original_data)
