@@ -1,1 +1,2 @@
-# A helper Telegram Bot for MAKO ed. company
+# A helper that allows you manage your business partners' birthdays via a Telegram bot.
+#### Currently switching to version 2 of the code base. The first version is available at https://github.com/dynamicsamic/makobot.
