@@ -1,22 +1,27 @@
 import asyncio
 from typing import Protocol
-
+from pathlib import Path
 from src.logging import get_logger
 
 logger = get_logger(__name__)
 
 
 class WriteSafeFileHandlerProtocol(Protocol):
-    def get_lock(self) -> asyncio.Lock: ...
-    async def create_backup(self) -> str: ...
-    async def restore_backup(self, backup_path: str): ...
+    def get_lock(self) -> asyncio.Lock:
+        ...
+
+    async def create_backup(self) -> Path:
+        ...
+
+    async def restore_backup(self, backup_path: Path):
+        ...
 
 
 class AtomicOperation:
     def __init__(self, handler: WriteSafeFileHandlerProtocol):
         self.handler = handler
         self.lock = self.handler.get_lock()
-        self.backup_path: str = None
+        self.backup_path: Path | None = None
 
     async def __aenter__(self):
         logger.debug("Acquiring write lock for atomic write")
