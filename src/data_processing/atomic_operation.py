@@ -41,8 +41,8 @@ class AtomicOperation:
         if exc_type is not None:
             logger.error(
                 (
-                    f"{exc_type} exception with value {exc_val} caught during atomic write.\n"
-                    f"Restoring backup from {self.backup_path}"
+                    f"{exc_type} exception with value {exc_val} caught during "
+                    f"atomic write.\nRestoring backup from {self.backup_path}"
                 )
             )
 

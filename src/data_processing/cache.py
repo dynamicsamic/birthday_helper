@@ -1,7 +1,8 @@
 import asyncio
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from typing import Callable, Iterable, Protocol
+from typing import Callable, Protocol, final
 
 from pandas import DataFrame
 
@@ -16,10 +17,11 @@ logger = get_logger(__name__)
 class DataCacheProtocol(Protocol):
     last_refreshed: datetime | None
 
-    async def get_data(self) -> Iterable: ...
-    async def update_data(self, data: Iterable) -> None: ...
+    async def get_data(self) -> Iterable[object]: ...
+    async def update_data(self, data: Iterable[object]) -> None: ...
 
 
+@final
 class DataFrameBasedCache:
     # Maybe add data validation logic?
     # This would be smth similar to DataPreprocessor
@@ -38,8 +40,8 @@ class DataFrameBasedCache:
         """
         self._executor = thread_pool_executor
         self._preprocessors = preprocessors or []
-        self._data: DataFrame = None
-        self._last_refreshed: datetime = None
+        self._data: DataFrame | None = None
+        self._last_refreshed: datetime | None = None
         self._lock = asyncio.Lock()
 
     @property
