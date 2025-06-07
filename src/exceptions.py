@@ -1,6 +1,9 @@
 class BaseApplicationException(Exception): ...
 
 
+class AtomicOperationError(BaseApplicationException): ...
+
+
 class DataCacheEmptyCacheError(BaseApplicationException): ...
 
 
